@@ -156,6 +156,8 @@ func HasFactories() bool {
 
 // Create a new ContainerHandler for the specified container.
 func NewContainerHandler(name string, watchType watcher.ContainerWatchSource, inHostNamespace bool) (ContainerHandler, bool, error) {
+	// 这里根据类型初始化对应的factory，并利用factory创建出container handler
+
 	factoriesLock.RLock()
 	defer factoriesLock.RUnlock()
 

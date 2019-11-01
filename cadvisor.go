@@ -131,6 +131,7 @@ func init() {
 }
 
 func main() {
+	// 初始化命令行参数
 	klog.InitFlags(nil)
 	defer klog.Flush()
 	flag.Parse()
@@ -140,19 +141,25 @@ func main() {
 		os.Exit(0)
 	}
 
+	// 使用一个set，过滤禁用的metric指标
 	includedMetrics := toIncludedMetrics(ignoreMetrics.MetricSet)
 
+	// 设置并行的核心数
 	setMaxProcs()
 
+	// 这里实现了一个MemoryStorage结构，允许注册storageDriver，比如es、influxdb等
 	memoryStorage, err := NewMemoryStorage()
 	if err != nil {
 		klog.Fatalf("Failed to initialize storage driver: %s", err)
 	}
 
+	// sysFs的实现，比如获取块设备或网络设备的信息等
 	sysFs := sysfs.NewRealSysFs()
 
+	// 初始化一个采集客户端，具体功能后面探索
 	collectorHttpClient := createCollectorHttpClient(*collectorCert, *collectorKey)
 
+	// 通过一个manager结构，实现核心业务逻辑
 	containerManager, err := manager.New(memoryStorage, sysFs, *maxHousekeepingInterval, *allowDynamicHousekeeping, includedMetrics, &collectorHttpClient, strings.Split(*rawCgroupPrefixWhiteList, ","))
 	if err != nil {
 		klog.Fatalf("Failed to create a Container Manager: %s", err)
@@ -167,30 +174,41 @@ func main() {
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	}
 
+	// 注册主要的HTTP handler句柄，包括认证、健康检查等API
 	// Register all HTTP handlers.
 	err = cadvisorhttp.RegisterHandlers(mux, containerManager, *httpAuthFile, *httpAuthRealm, *httpDigestFile, *httpDigestRealm, *urlBasePrefix)
 	if err != nil {
 		klog.Fatalf("Failed to register HTTP handlers: %v", err)
 	}
 
+	// 一个容器标签的函数，后续会用它来做容器标签的白名单过滤
 	containerLabelFunc := metrics.DefaultContainerLabels
 	if !*storeContainerLabels {
 		whitelistedLabels := strings.Split(*whitelistedContainerLabels, ",")
 		containerLabelFunc = metrics.BaseContainerLabels(whitelistedLabels)
 	}
 
+	// 注册/metrics的prom api
+	// 这里用到了之前的containerLabelFunc做prom label的处理函数
+	// 最终初始化一个NewPrometheusCollector并启动/metrics api
+	// 这里主要会用到containerManager做infoProvider，执行`SubcontainersInfo`采集容器数据
+	// 该方法会通过`getSubcontainers`来获取自根路径下的所有子容器
+	// 并通过`containerDataSliceToContainerInfoSlice`方法获取每个容器的info
 	cadvisorhttp.RegisterPrometheusHandler(mux, containerManager, *prometheusEndpoint, containerLabelFunc, includedMetrics)
 
+	// 启动manager，它将会做一系列的初始化操作
 	// Start the manager.
 	if err := containerManager.Start(); err != nil {
 		klog.Fatalf("Failed to start container manager: %v", err)
 	}
 
+	// 注册信号处理，在收到退出信号时做manager的平滑退出处理
 	// Install signal handler.
 	installSignalHandler(containerManager)
 
 	klog.V(1).Infof("Starting cAdvisor version: %s-%s on port %d", version.Info["version"], version.Info["revision"], *argPort)
 
+	// 注册根路径，访问根时会跳到mux提供的一个静态页面
 	rootMux := http.NewServeMux()
 	rootMux.Handle(*urlBasePrefix+"/", http.StripPrefix(*urlBasePrefix, mux))
 

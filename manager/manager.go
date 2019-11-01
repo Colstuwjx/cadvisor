@@ -35,7 +35,7 @@ import (
 	"github.com/google/cadvisor/events"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
-	"github.com/google/cadvisor/info/v2"
+	v2 "github.com/google/cadvisor/info/v2"
 	"github.com/google/cadvisor/machine"
 	"github.com/google/cadvisor/utils/oomparser"
 	"github.com/google/cadvisor/utils/sysfs"
@@ -139,6 +139,7 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
 	}
 
 	// Detect the container we are running on.
+	// 使用runc的cgroup包获取cadvisor当前进程所属的cgroup路径
 	selfContainer, err := cgroups.GetOwnCgroupPath("cpu")
 	if err != nil {
 		return nil, err
@@ -147,15 +148,18 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
 
 	context := fs.Context{}
 
+	// 初始化一个fs上下文，暂时不明用途
 	if err := container.InitializeFSContext(&context); err != nil {
 		return nil, err
 	}
 
+	// 根据fs context初始化一个fsInfo的句柄
 	fsInfo, err := fs.NewFsInfo(context)
 	if err != nil {
 		return nil, err
 	}
 
+	// 如果rootfs挂载了的话，那么是在自己的namespace里运行，否则便是在host namespace里
 	// If cAdvisor was started with host's rootfs mounted, assume that its running
 	// in its own namespaces.
 	inHostNamespace := false
@@ -163,9 +167,13 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
 		inHostNamespace = true
 	}
 
+	// 利用watcher包初始化一个容器事件的channel，暂时不明用途
 	// Register for new subcontainers.
 	eventsChannel := make(chan watcher.ContainerEvent, 16)
 
+	// 新建一个manager对象，注意这里除了一些传入参数外，
+	// 还初始化了一些比如以namespace区分的容器名称为键的容器数据字典
+	// 另外还新建一个nvidia的manager对象
 	newManager := &manager{
 		containers:                            make(map[namespacedContainerName]*containerData),
 		quitChannels:                          make([]chan error, 0, 2),
@@ -185,6 +193,7 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
 		rawContainerCgroupPathPrefixWhiteList: rawContainerCgroupPathPrefixWhiteList,
 	}
 
+	// 初始化一个采集了宿主机上信息的machineInfo
 	machineInfo, err := machine.Info(sysfs, fsInfo, inHostNamespace)
 	if err != nil {
 		return nil, err
@@ -192,12 +201,14 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
 	newManager.machineInfo = *machineInfo
 	klog.V(1).Infof("Machine: %+v", newManager.machineInfo)
 
+	// 获取版本信息，包括内核和cadvisor版本信息等
 	versionInfo, err := getVersionInfo()
 	if err != nil {
 		return nil, err
 	}
 	klog.V(1).Infof("Version: %+v", *versionInfo)
 
+	// 使用一些注册的命令行参数作为事件存储管理策略，新建一个event manager
 	newManager.eventHandler = events.NewEventManager(parseEventsStoragePolicy())
 	return newManager, nil
 }
@@ -237,19 +248,25 @@ type manager struct {
 
 // Start the container manager.
 func (self *manager) Start() error {
+	// manager的启动逻辑，也是整个cadvisor的核心部分
+
+	// container watcher，先初始化一个插件化的宿主机上信息的watcher
 	self.containerWatchers = container.InitializePlugins(self, self.fsInfo, self.includedMetrics)
 
+	// 原始的宿主机上的信息采集注册
 	err := raw.Register(self, self.fsInfo, self.includedMetrics, self.rawContainerCgroupPathPrefixWhiteList)
 	if err != nil {
 		klog.Errorf("Registration of the raw container factory failed: %v", err)
 	}
 
+	// 初始化raw的watcher
 	rawWatcher, err := raw.NewRawContainerWatcher()
 	if err != nil {
 		return err
 	}
 	self.containerWatchers = append(self.containerWatchers, rawWatcher)
 
+	// 通过event的形式汇报OOM
 	// Watch for OOMs.
 	err = self.watchForNewOoms()
 	if err != nil {
@@ -257,19 +274,25 @@ func (self *manager) Start() error {
 	}
 
 	// If there are no factories, don't start any housekeeping and serve the information we do have.
+	// 这里的factory就是各种container handler实现的工厂，如果没有的话，就无需做housekeeping
 	if !container.HasFactories() {
 		return nil
 	}
 
 	// Setup collection of nvidia GPU metrics if any of them are attached to the machine.
+	// 尝试设置nvdiaManager
 	self.nvidiaManager.Setup()
 
 	// Create root and then recover all containers.
+	// 启动根下的container
 	err = self.createContainer("/", watcher.Raw)
 	if err != nil {
 		return err
 	}
 	klog.V(2).Infof("Starting recovery of all containers")
+	// 尝试去主动发现根下的所有子容器
+	// 这里主要是通过每个handler各自实现的`ListContainers`方法
+	// raw的话即是发现目录来找出子容器
 	err = self.detectSubcontainers("/")
 	if err != nil {
 		return err
@@ -277,6 +300,7 @@ func (self *manager) Start() error {
 	klog.V(2).Infof("Recovery completed")
 
 	// Watch for new container.
+	// 监听新建的容器，每次有新建的容器事件时执行对应的任务
 	quitWatcher := make(chan error)
 	err = self.watchForNewContainers(quitWatcher)
 	if err != nil {
@@ -285,10 +309,12 @@ func (self *manager) Start() error {
 	self.quitChannels = append(self.quitChannels, quitWatcher)
 
 	// Look for new containers in the main housekeeping thread.
+	// 常驻的housekeeping线程做长轮询式的子容器数据更新
 	quitGlobalHousekeeping := make(chan error)
 	self.quitChannels = append(self.quitChannels, quitGlobalHousekeeping)
 	go self.globalHousekeeping(quitGlobalHousekeeping)
 
+	// 常驻线程做长轮询式的机器信息更新
 	quitUpdateMachineInfo := make(chan error)
 	self.quitChannels = append(self.quitChannels, quitUpdateMachineInfo)
 	go self.updateMachineInfo(quitUpdateMachineInfo)
@@ -899,6 +925,7 @@ func (m *manager) createContainerLocked(containerName string, watchSource watche
 		return nil
 	}
 
+	// 这里会根据容器信息创建容器的handler，后面会用到该handler来获取容器的info
 	handler, accept, err := container.NewContainerHandler(containerName, watchSource, m.inHostNamespace)
 	if err != nil {
 		return err
@@ -908,6 +935,8 @@ func (m *manager) createContainerLocked(containerName string, watchSource watche
 		klog.V(4).Infof("ignoring container %q", containerName)
 		return nil
 	}
+
+	// 这里创建一个用来管理自定义metric的Collect Manager
 	collectorManager, err := collector.NewCollectorManager()
 	if err != nil {
 		return err
@@ -933,12 +962,14 @@ func (m *manager) createContainerLocked(containerName string, watchSource watche
 	// Add collectors
 	labels := handler.GetContainerLabels()
 	collectorConfigs := collector.GetCollectorConfigs(labels)
+	// 这里会注册对应的collector，定期执行`Collect`方法来采集数据
 	err = m.registerCollectors(collectorConfigs, cont)
 	if err != nil {
 		klog.Warningf("Failed to register collectors for %q: %v", containerName, err)
 	}
 
 	// Add the container name and all its aliases. The aliases must be within the namespace of the factory.
+	// 将容器加入到containers的watcher map里
 	m.containers[namespacedName] = cont
 	for _, alias := range cont.info.Aliases {
 		m.containers[namespacedContainerName{
@@ -1034,6 +1065,8 @@ func (m *manager) getContainersDiff(containerName string) (added []info.Containe
 	if !ok {
 		return nil, nil, fmt.Errorf("failed to find container %q while checking for new containers", containerName)
 	}
+
+	// 这里会利用每个容器对应的handler来获取容器list
 	allContainers, err := cont.handler.ListContainers(container.ListRecursive)
 
 	if err != nil {
